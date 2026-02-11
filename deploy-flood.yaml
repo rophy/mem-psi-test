@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dentry-flooder
+  namespace: slab-stress-test
+  labels:
+    app: dentry-flooder
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: dentry-flooder
+  template:
+    metadata:
+      labels:
+        app: dentry-flooder
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: flooder
+        image: dentry-flooder:local
+        imagePullPolicy: Never
+        env:
+        - name: NUM_DIRS
+          value: "50"
+        - name: FILES_PER_DIR
+          value: "100000"
+        - name: PARALLEL
+          value: "4"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"

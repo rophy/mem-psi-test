@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memory-pressure
+  namespace: slab-stress-test
+  labels:
+    app: memory-pressure
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: memory-pressure
+    spec:
+      terminationGracePeriodSeconds: 0
+      restartPolicy: Never
+      containers:
+      - name: pressure
+        image: memory-pressure:local
+        imagePullPolicy: Never
+        env:
+        - name: ALLOC_MB
+          value: "3500"
+        - name: CHUNK_MB
+          value: "64"
+        - name: ALLOC_WORKERS
+          value: "2"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            # High limit to let it eat into node allocatable memory
+            # and force kernel-level reclaim of slab caches
+            memory: "3Gi"
+            cpu: "1"

@@ -35,8 +35,8 @@ phase_flood() {
   kubectl --context "$CTX" apply -f "$SCRIPT_DIR/namespace.yaml"
 
   # Lower vfs_cache_pressure to make reclaim harder (increases lock hold time)
-  log "Tuning kernel: vfs_cache_pressure=10"
-  minikube ssh -- "sudo sysctl -w vm.vfs_cache_pressure=10" || true
+  log "Tuning kernel: vfs_cache_pressure=1 (hoard dentries, force large batch reclaim)"
+  minikube ssh -- "sudo sysctl -w vm.vfs_cache_pressure=1" || true
 
   # Capture baseline
   log "Baseline slab stats:"
@@ -65,22 +65,36 @@ phase_flood() {
 phase_pressure() {
   log "=== Phase: Apply memory pressure ==="
 
-  # Delete previous job if it exists
-  kubectl --context "$CTX" -n "$NS" delete job memory-pressure --ignore-not-found=true
+  # Delete previous deployment if it exists
+  kubectl --context "$CTX" -n "$NS" delete deployment memory-pressure --ignore-not-found=true
 
-  log "Deploying memory pressure job..."
+  log "Deploying memory pressure pods..."
   kubectl --context "$CTX" apply -f "$SCRIPT_DIR/deploy-pressure.yaml"
 
-  log "Memory pressure applied. Watch monitor.sh output for node status changes."
-  log "The memory pressure job will push the system into slab reclaim."
+  log "Waiting for pressure pods to start..."
+  kubectl --context "$CTX" -n "$NS" wait --for=condition=ready pod -l app=memory-pressure --timeout=120s || true
 
-  # Wait a bit and check
-  sleep 10
-  log "Node status:"
-  kubectl --context "$CTX" get nodes || echo "kubectl failed (node may be unresponsive)"
+  log "Memory pressure pods running. Monitoring node status..."
 
-  log "Pod status:"
-  kubectl --context "$CTX" -n "$NS" get pods || echo "kubectl failed"
+  # Monitor for 2 minutes, checking every 10s
+  for i in $(seq 1 12); do
+    log "--- check $i/12 ---"
+    node_status=$(kubectl --context "$CTX" get nodes --no-headers 2>/dev/null || echo "KUBECTL FAILED")
+    log "Node: $node_status"
+
+    mem_info=$(minikube ssh -- "cat /proc/meminfo | grep -E 'MemAvailable|Slab|SReclaimable'" 2>/dev/null || echo "SSH FAILED")
+    log "Memory: $mem_info"
+
+    pod_summary=$(kubectl --context "$CTX" -n "$NS" get pods --no-headers 2>/dev/null | wc -l || echo "?")
+    log "Pods: $pod_summary total"
+
+    if echo "$node_status" | grep -q "NotReady"; then
+      log "*** NODE NOT READY DETECTED ***"
+      break
+    fi
+
+    sleep 10
+  done
 }
 
 phase_collect() {

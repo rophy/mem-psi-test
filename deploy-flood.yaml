@@ -22,15 +22,15 @@ spec:
         imagePullPolicy: Never
         env:
         - name: NUM_DIRS
-          value: "50"
-        - name: FILES_PER_DIR
-          value: "100000"
+          value: "200"
+        - name: LINKS_PER_DIR
+          value: "50000"
         - name: PARALLEL
           value: "4"
         resources:
           requests:
-            memory: "64Mi"
-            cpu: "100m"
+            memory: "32Mi"
+            cpu: "50m"
           limits:
-            memory: "256Mi"
+            memory: "128Mi"
             cpu: "500m"

@@ -1,36 +1,46 @@
-apiVersion: batch/v1
-kind: Job
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: memory-pressure
   namespace: slab-stress-test
   labels:
     app: memory-pressure
 spec:
-  backoffLimit: 0
+  # Multiple replicas to collectively exhaust node memory.
+  # Each pod allocates ALLOC_MB of anonymous memory.
+  # Total pressure = replicas * ALLOC_MB.
+  replicas: 6
+  selector:
+    matchLabels:
+      app: memory-pressure
   template:
     metadata:
       labels:
         app: memory-pressure
     spec:
       terminationGracePeriodSeconds: 0
-      restartPolicy: Never
+      volumes:
+      - name: mem-vol
+        emptyDir:
+          # memory-backed tmpfs: writes here create anonymous pages
+          # that count against the pod's cgroup and node memory
+          medium: Memory
       containers:
       - name: pressure
         image: memory-pressure:local
         imagePullPolicy: Never
+        volumeMounts:
+        - name: mem-vol
+          mountPath: /mem
         env:
         - name: ALLOC_MB
-          value: "3500"
+          value: "400"
         - name: CHUNK_MB
-          value: "64"
-        - name: ALLOC_WORKERS
-          value: "2"
+          value: "32"
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "200m"
+            memory: "64Mi"
+            cpu: "50m"
           limits:
-            # High limit to let it eat into node allocatable memory
-            # and force kernel-level reclaim of slab caches
-            memory: "3Gi"
-            cpu: "1"
+            memory: "512Mi"
+            cpu: "250m"

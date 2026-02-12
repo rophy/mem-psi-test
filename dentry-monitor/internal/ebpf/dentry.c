@@ -20,6 +20,7 @@ struct dentry_stats {
  * Bit 31 of depth is set if the walk reached the filesystem root. */
 #define MAX_PATH_DEPTH 8
 #define MAX_NAME_LEN 64
+#define MAX_FSTYPE_LEN 16
 #define DEPTH_ROOT_FLAG 0x80000000U
 
 struct dentry_trace_event {
@@ -28,6 +29,7 @@ struct dentry_trace_event {
     __u32 operation; /* 0=alloc, 1=positive, 2=negative */
     __u32 depth;     /* bits 0-30: component count, bit 31: reached root */
     char  names[MAX_PATH_DEPTH][MAX_NAME_LEN]; /* 8 * 64 = 512 bytes */
+    char  fstype[MAX_FSTYPE_LEN];              /* filesystem type name */
 };
 
 /* Tracing enabled flag (index 0 in array map) */
@@ -66,25 +68,31 @@ struct {
 } reclaim_count SEC(".maps");
 
 /*
- * Check if a dentry is on a real disk filesystem (ext4, xfs, btrfs, etc.)
- * vs a virtual/mount filesystem (cgroup2, overlay, proc, tmpfs, etc.).
- * Used to distinguish the real VFS root from filesystem mount roots.
+ * Check if a dentry is on a "real" filesystem whose root represents a
+ * meaningful path root, vs a virtual/pseudo filesystem (cgroup2, proc,
+ * sysfs, overlay) where reaching the mount root doesn't mean we have
+ * a complete path from /.
+ *
+ * Uses a denylist: exclude known pseudo-FS types, accept everything else
+ * (ext4, xfs, btrfs, tmpfs, etc.).
  */
 static __always_inline bool is_real_root(struct dentry *d) {
-    char fstype[8];
+    char fstype[12];
     const char *name = BPF_CORE_READ(d, d_sb, s_type, name);
     if (!name)
         return false;
     if (bpf_probe_read_kernel_str(fstype, sizeof(fstype), (void *)name) <= 0)
         return false;
-    /* Check common disk filesystem types */
-    if (fstype[0] == 'e' && fstype[1] == 'x' && fstype[2] == 't')
-        return true; /* ext2/ext3/ext4 */
-    if (fstype[0] == 'x' && fstype[1] == 'f' && fstype[2] == 's')
-        return true; /* xfs */
-    if (fstype[0] == 'b' && fstype[1] == 't' && fstype[2] == 'r')
-        return true; /* btrfs */
-    return false;
+    /* Exclude pseudo/virtual filesystems */
+    if (fstype[0] == 'c' && fstype[1] == 'g' && fstype[2] == 'r')
+        return false; /* cgroup2, cgroup */
+    if (fstype[0] == 'p' && fstype[1] == 'r' && fstype[2] == 'o')
+        return false; /* proc */
+    if (fstype[0] == 's' && fstype[1] == 'y' && fstype[2] == 's')
+        return false; /* sysfs */
+    if (fstype[0] == 'o' && fstype[1] == 'v' && fstype[2] == 'e')
+        return false; /* overlay */
+    return true;
 }
 
 /* --- Helpers --- */
@@ -158,6 +166,11 @@ int trace_d_alloc_path(struct pt_regs *ctx) {
     evt->cgroup_id = cgid;
     evt->operation = 0; /* alloc */
     evt->depth = 0;
+
+    /* Read filesystem type from parent's superblock */
+    const char *fsname = BPF_CORE_READ(parent, d_sb, s_type, name);
+    if (fsname)
+        bpf_probe_read_kernel_str(evt->fstype, MAX_FSTYPE_LEN, (void *)fsname);
 
     /* Declare all dentry pointers upfront (goto-safe) */
     const unsigned char *np;

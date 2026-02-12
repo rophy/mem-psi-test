@@ -29,6 +29,7 @@ type TraceEvent struct {
 	CgroupID  uint64    `json:"cgroup_id"`
 	Operation string    `json:"operation"`
 	Path      string    `json:"path"`
+	Fstype    string    `json:"fstype"`
 }
 
 // rawTraceEvent matches the eBPF struct dentry_trace_event layout.
@@ -40,6 +41,7 @@ type rawTraceEvent struct {
 	Operation uint32
 	Depth     uint32
 	Names     [8][64]byte
+	Fstype    [16]byte
 }
 
 const depthRootFlag = 0x80000000
@@ -145,6 +147,7 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 		traceEvt.CgroupID = evt.CgroupID
 		traceEvt.Operation = opName(evt.Operation)
 		traceEvt.Path = path
+		traceEvt.Fstype = extractString(evt.Fstype[:])
 
 		if info != nil {
 			traceEvt.Pod = info.Pod
@@ -334,6 +337,13 @@ func opName(op uint32) string {
 	default:
 		return "unknown"
 	}
+}
+
+func extractString(b []byte) string {
+	if idx := bytes.IndexByte(b, 0); idx > 0 {
+		return string(b[:idx])
+	}
+	return ""
 }
 
 func containsSubstring(s, substr string) bool {

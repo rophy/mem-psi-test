@@ -34,13 +34,16 @@ type TraceEvent struct {
 
 // rawTraceEvent matches the eBPF struct dentry_trace_event layout.
 // Path components are stored leaf-to-root: names[0]=filename, names[1]=parent, etc.
+// Bit 31 of Depth is set if the walk reached the filesystem root.
 type rawTraceEvent struct {
 	Timestamp uint64
 	CgroupID  uint64
 	Operation uint32
 	Depth     uint32
-	Names     [4][64]byte
+	Names     [8][64]byte
 }
+
+const depthRootFlag = 0x80000000
 
 // TraceConfig controls tracing behavior.
 // Pattern filtering and rate limiting are done in userspace.
@@ -294,10 +297,13 @@ type EventsResponse struct {
 
 // buildPath reconstructs a full path from the name components.
 // Components are stored leaf-to-root, so we reverse them.
+// If the eBPF walk reached the filesystem root, the path starts with "/".
+// Otherwise (truncated), no leading "/" signals a partial path.
 func buildPath(evt *rawTraceEvent) string {
-	depth := int(evt.Depth)
-	if depth > 4 {
-		depth = 4
+	reachedRoot := evt.Depth&depthRootFlag != 0
+	depth := int(evt.Depth &^ depthRootFlag)
+	if depth > 8 {
+		depth = 8
 	}
 	parts := make([]string, 0, depth)
 	for i := depth - 1; i >= 0; i-- {
@@ -313,7 +319,10 @@ func buildPath(evt *rawTraceEvent) string {
 	if len(parts) == 0 {
 		return "/"
 	}
-	return "/" + strings.Join(parts, "/")
+	if reachedRoot {
+		return "/" + strings.Join(parts, "/")
+	}
+	return strings.Join(parts, "/")
 }
 
 func parseRawEvent(data []byte) (*rawTraceEvent, error) {

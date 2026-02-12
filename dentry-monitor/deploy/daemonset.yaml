@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dentry-monitor
+  labels:
+    app: dentry-monitor
+spec:
+  selector:
+    matchLabels:
+      app: dentry-monitor
+  template:
+    metadata:
+      labels:
+        app: dentry-monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostPID: true
+      containers:
+      - name: monitor
+        image: dentry-monitor:local
+        imagePullPolicy: Never
+        args:
+        - --listen=:9090
+        - --proc=/host/proc
+        - --cgroup=/host/sys/fs/cgroup
+        ports:
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: cgroup
+          mountPath: /host/sys/fs/cgroup
+          readOnly: true
+        - name: bpf
+          mountPath: /sys/fs/bpf
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+      - name: bpf
+        hostPath:
+          path: /sys/fs/bpf
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule

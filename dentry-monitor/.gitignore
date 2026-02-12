@@ -1,0 +1,8 @@
+# Generated eBPF files (compiled in Docker)
+internal/ebpf/*_bpfel.go
+internal/ebpf/*_bpfel.o
+internal/ebpf/*_bpfeb.go
+internal/ebpf/*_bpfeb.o
+
+# vmlinux.h is host-specific and very large; generated in Docker build
+internal/ebpf/vmlinux.h

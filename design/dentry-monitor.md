@@ -111,6 +111,158 @@ the results as Prometheus metrics.
 - **Container**: multi-stage Docker build (golang + clang → distroless)
 - **Deployment**: DaemonSet with privileged access for kprobe attachment
 
+## Tracing Mode
+
+Metrics show **which containers** create the most dentries, but not **which files**.
+To understand exactly how MariaDB generates dentries (e.g. temp table patterns,
+`.ibd` file churn), tracing mode captures individual file paths.
+
+### How It Works
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Kernel (eBPF)                                       │
+│                                                      │
+│  kprobe/d_alloc:                                     │
+│    1. Read filename from dentry->d_name.name         │
+│    2. Walk d_parent chain to build path (up to 8     │
+│       levels)                                        │
+│    3. Check path against filter (e.g. ".ibd", "#sql",│
+│       "/tmp")                                        │
+│    4. If match → emit event to BPF ring buffer       │
+│       {timestamp, cgroup_id, operation, path}        │
+└──────────────┬───────────────────────────────────────┘
+               │ BPF_MAP_TYPE_RINGBUF
+               ▼
+┌──────────────────────────────────────────────────────┐
+│  Userspace (Go)                                      │
+│                                                      │
+│    - Consume ring buffer events                      │
+│    - Resolve cgroup_id → pod/namespace/container     │
+│    - Store in circular buffer (last N events)        │
+│    - Expose via HTTP API                             │
+└──────────────────────────────────────────────────────┘
+```
+
+### Why Ring Buffer
+
+Unlike the metrics path (hash map, polled), tracing needs to export
+variable-length file paths per event. `BPF_MAP_TYPE_RINGBUF` supports:
+- Variable-size records (paths vary from 10 to 200+ bytes)
+- Lock-free, multi-producer writes from eBPF programs
+- Efficient epoll-based consumption in userspace
+
+### Kernel-side Filtering
+
+At millions of dentry ops/sec, emitting every event would overwhelm the ring
+buffer and userspace. The eBPF program filters in-kernel:
+
+- **Path pattern matching**: only emit events where the filename contains
+  configurable substrings (e.g. `.ibd`, `#sql`, `/tmp`, `.frm`)
+- **Rate limiting**: per-cgroup token bucket, e.g. max 100 events/sec per
+  container
+- **Cgroup filter**: optionally trace only specific cgroup IDs
+
+Filters are configured via a BPF array map that userspace populates at startup
+and can update at runtime via the HTTP API.
+
+### eBPF Path Reconstruction
+
+```c
+// Walk up to 8 levels of d_parent to reconstruct path
+SEC("kprobe/d_alloc")
+int trace_d_alloc_path(struct pt_regs *ctx) {
+    struct dentry *parent = (struct dentry *)PT_REGS_PARM1(ctx);
+    char path[256] = {};
+    int pos = 255;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        struct qstr name;
+        bpf_probe_read_kernel(&name, sizeof(name), &parent->d_name);
+        char component[32];
+        int len = bpf_probe_read_kernel_str(component, sizeof(component),
+                                            (void *)name.name);
+        if (len <= 1) break;
+        // prepend /component to path buffer
+        pos -= len;
+        if (pos < 0) break;
+        path[pos] = '/';
+        bpf_probe_read_kernel(&path[pos+1], len, component);
+        // walk up
+        bpf_probe_read_kernel(&parent, sizeof(parent), &parent->d_parent);
+    }
+    // ... apply filter, emit to ring buffer if matched
+}
+```
+
+### HTTP API
+
+Tracing results are exposed via a JSON HTTP API on the same port as metrics:
+
+**`GET /traces`** — returns recent dentry trace events
+
+```json
+{
+  "events": [
+    {
+      "timestamp": "2024-01-15T10:30:45.123Z",
+      "pod": "mariadb-0",
+      "namespace": "production",
+      "container": "mariadb",
+      "operation": "alloc",
+      "path": "/var/lib/mysql/tmp/#sql_1234_0.ibd"
+    },
+    {
+      "timestamp": "2024-01-15T10:30:45.124Z",
+      "pod": "mariadb-0",
+      "namespace": "production",
+      "container": "mariadb",
+      "operation": "alloc",
+      "path": "/var/lib/mysql/tmp/#sql_1234_1.frm"
+    }
+  ],
+  "total": 2,
+  "buffer_size": 10000,
+  "dropped": 0
+}
+```
+
+Query parameters:
+- `?pod=mariadb-0` — filter by pod name
+- `?namespace=production` — filter by namespace
+- `?path=.ibd` — filter by path substring
+- `?limit=100` — max events to return (default 100)
+- `?since=2024-01-15T10:30:00Z` — events after timestamp
+
+**`GET /traces/config`** — view current trace filter configuration
+
+**`PUT /traces/config`** — update trace filters at runtime
+
+```json
+{
+  "enabled": true,
+  "path_patterns": [".ibd", "#sql", ".frm", "/tmp"],
+  "rate_limit_per_cgroup": 100,
+  "cgroup_filter": []
+}
+```
+
+### Tracing vs Metrics
+
+| Aspect | Metrics mode | Tracing mode |
+|--------|-------------|--------------|
+| Data | Counters per cgroup | Individual file paths |
+| Overhead | Near zero | Low (filtered) |
+| Always on | Yes | Opt-in |
+| Storage | BPF hash map | BPF ring buffer → circular buffer |
+| Export | Prometheus `/metrics` | HTTP `/traces` |
+| Use case | Monitoring & alerting | Root cause investigation |
+
+Tracing is designed for **investigation sessions** — enable it when you need
+to understand what a specific container is doing, then disable it. Metrics
+mode runs continuously for monitoring and alerting.
+
 ## Scope
 
 ### In scope (v1)
@@ -118,6 +270,7 @@ the results as Prometheus metrics.
 - Per-cgroup counters in BPF map
 - Cgroup ID → pod name resolution
 - Prometheus metrics endpoint
+- Tracing mode with path capture and HTTP API
 - DaemonSet deployment manifest
 
 ### Out of scope (future)

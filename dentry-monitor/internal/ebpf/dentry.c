@@ -14,13 +14,18 @@ struct dentry_stats {
     __u64 negative;
 };
 
-/* Trace event emitted to ring buffer */
+/* Trace event emitted to ring buffer.
+ * Path is stored as up to 4 separate name components (leaf to root).
+ * Userspace reconstructs the full path by reversing the order. */
+#define MAX_PATH_DEPTH 4
+#define MAX_NAME_LEN 64
+
 struct dentry_trace_event {
     __u64 timestamp;
     __u64 cgroup_id;
     __u32 operation; /* 0=alloc, 1=positive, 2=negative */
-    __u32 path_len;
-    char  path[256];
+    __u32 depth;     /* number of valid name components */
+    char  names[MAX_PATH_DEPTH][MAX_NAME_LEN]; /* 4 * 64 = 256 bytes */
 };
 
 /* Tracing enabled flag (index 0 in array map) */
@@ -99,8 +104,16 @@ int trace_d_alloc(struct pt_regs *ctx) {
 }
 
 /*
- * d_alloc tracing — capture parent dentry filename.
+ * d_alloc tracing — capture full path (up to 4 components).
  * This is a separate kprobe so the metrics path stays simple.
+ *
+ * d_alloc(struct dentry *parent, const struct qstr *name)
+ * - names[0] = new dentry name (from qstr PARM2)
+ * - names[1] = parent directory name
+ * - names[2] = grandparent directory name
+ * - names[3] = great-grandparent directory name
+ *
+ * Manually unrolled to avoid verifier issues on kernel 5.10.
  */
 SEC("kprobe/d_alloc")
 int trace_d_alloc_path(struct pt_regs *ctx) {
@@ -120,17 +133,44 @@ int trace_d_alloc_path(struct pt_regs *ctx) {
     evt->timestamp = bpf_ktime_get_ns();
     evt->cgroup_id = cgid;
     evt->operation = 0; /* alloc */
+    evt->depth = 0;
 
-    /* Read the parent dentry name — this is the directory containing
-     * the new dentry. Sufficient to identify patterns like /tmp, #sql, etc. */
-    const unsigned char *name = BPF_CORE_READ(parent, d_name.name);
-    if (name) {
-        int ret = bpf_probe_read_kernel_str(evt->path, sizeof(evt->path),
-                                            (void *)name);
-        evt->path_len = ret > 0 ? ret - 1 : 0;
-    } else {
-        evt->path[0] = '\0';
-        evt->path_len = 0;
+    /* names[0]: new dentry name from qstr parameter */
+    const struct qstr *qname = (const struct qstr *)PT_REGS_PARM2(ctx);
+    if (qname) {
+        const unsigned char *np = BPF_CORE_READ(qname, name);
+        if (np) {
+            bpf_probe_read_kernel_str(evt->names[0], MAX_NAME_LEN, (void *)np);
+            evt->depth = 1;
+        }
+    }
+
+    /* names[1]: parent directory name */
+    const unsigned char *np = BPF_CORE_READ(parent, d_name.name);
+    if (np) {
+        bpf_probe_read_kernel_str(evt->names[1], MAX_NAME_LEN, (void *)np);
+        if (evt->depth < 2)
+            evt->depth = 2;
+    }
+
+    /* names[2]: grandparent directory name */
+    struct dentry *d2 = BPF_CORE_READ(parent, d_parent);
+    if (d2 && d2 != parent) {
+        np = BPF_CORE_READ(d2, d_name.name);
+        if (np) {
+            bpf_probe_read_kernel_str(evt->names[2], MAX_NAME_LEN, (void *)np);
+            evt->depth = 3;
+        }
+
+        /* names[3]: great-grandparent directory name */
+        struct dentry *d3 = BPF_CORE_READ(d2, d_parent);
+        if (d3 && d3 != d2) {
+            np = BPF_CORE_READ(d3, d_name.name);
+            if (np) {
+                bpf_probe_read_kernel_str(evt->names[3], MAX_NAME_LEN, (void *)np);
+                evt->depth = 4;
+            }
+        }
     }
 
     bpf_ringbuf_submit(evt, 0);

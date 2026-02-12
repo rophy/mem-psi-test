@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,12 +33,13 @@ type TraceEvent struct {
 }
 
 // rawTraceEvent matches the eBPF struct dentry_trace_event layout.
+// Path components are stored leaf-to-root: names[0]=filename, names[1]=parent, etc.
 type rawTraceEvent struct {
 	Timestamp uint64
 	CgroupID  uint64
 	Operation uint32
-	PathLen   uint32
-	Path      [256]byte
+	Depth     uint32
+	Names     [4][64]byte
 }
 
 // TraceConfig controls tracing behavior.
@@ -126,7 +128,7 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 
 		// Resolve cgroup to pod
 		info := c.resolver.Resolve(evt.CgroupID)
-		path := string(bytes.TrimRight(evt.Path[:evt.PathLen], "\x00"))
+		path := buildPath(evt)
 
 		// Userspace pattern filtering
 		c.mu.RLock()
@@ -288,6 +290,30 @@ type EventsResponse struct {
 	Total      int          `json:"total"`
 	BufferSize int          `json:"buffer_size"`
 	Dropped    uint64       `json:"dropped"`
+}
+
+// buildPath reconstructs a full path from the name components.
+// Components are stored leaf-to-root, so we reverse them.
+func buildPath(evt *rawTraceEvent) string {
+	depth := int(evt.Depth)
+	if depth > 4 {
+		depth = 4
+	}
+	parts := make([]string, 0, depth)
+	for i := depth - 1; i >= 0; i-- {
+		slot := evt.Names[i][:]
+		// Find first null — ringbuf memory is uninitialized after the null terminator
+		if idx := bytes.IndexByte(slot, 0); idx > 0 {
+			name := string(slot[:idx])
+			if name != "/" {
+				parts = append(parts, name)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(parts, "/")
 }
 
 func parseRawEvent(data []byte) (*rawTraceEvent, error) {

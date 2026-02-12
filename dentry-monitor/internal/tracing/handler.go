@@ -2,6 +2,8 @@ package tracing
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -20,6 +22,7 @@ func NewHandler(consumer *Consumer) *Handler {
 // RegisterRoutes registers tracing endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/traces", h.handleTraces)
+	mux.HandleFunc("/traces/stream", h.handleStream)
 	mux.HandleFunc("/traces/config", h.handleConfig)
 }
 
@@ -56,6 +59,47 @@ func (h *Handler) handleTraces(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	id, ch := h.consumer.Subscribe(64)
+	defer h.consumer.Unsubscribe(id)
+
+	log.Printf("tracing: SSE client connected (sub %d)", id)
+	defer log.Printf("tracing: SSE client disconnected (sub %d)", id)
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(evt)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
 }
 
 func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {

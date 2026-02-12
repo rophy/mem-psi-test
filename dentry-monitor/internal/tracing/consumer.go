@@ -68,6 +68,11 @@ type Consumer struct {
 	dropped uint64
 
 	config TraceConfig
+
+	// Subscribers for SSE streaming
+	subMu   sync.Mutex
+	subs    map[uint64]chan TraceEvent
+	nextSub uint64
 }
 
 // NewConsumer creates a trace event consumer.
@@ -78,6 +83,7 @@ func NewConsumer(ringbufMap, configMap *ebpf.Map, resolver *cgroupmap.Resolver, 
 		resolver:   resolver,
 		buffer:     make([]TraceEvent, bufSize),
 		bufSize:    bufSize,
+		subs:       make(map[uint64]chan TraceEvent),
 		config: TraceConfig{
 			Enabled: false,
 		},
@@ -153,7 +159,40 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 			c.count++
 		}
 		c.mu.Unlock()
+
+		// Fan out to SSE subscribers (non-blocking)
+		c.subMu.Lock()
+		for _, ch := range c.subs {
+			select {
+			case ch <- traceEvt:
+			default:
+				// subscriber too slow, drop event
+			}
+		}
+		c.subMu.Unlock()
 	}
+}
+
+// Subscribe returns a channel that receives live trace events.
+// Call Unsubscribe with the returned ID when done.
+func (c *Consumer) Subscribe(bufSize int) (uint64, <-chan TraceEvent) {
+	ch := make(chan TraceEvent, bufSize)
+	c.subMu.Lock()
+	id := c.nextSub
+	c.nextSub++
+	c.subs[id] = ch
+	c.subMu.Unlock()
+	return id, ch
+}
+
+// Unsubscribe removes a subscriber and closes its channel.
+func (c *Consumer) Unsubscribe(id uint64) {
+	c.subMu.Lock()
+	if ch, ok := c.subs[id]; ok {
+		delete(c.subs, id)
+		close(ch)
+	}
+	c.subMu.Unlock()
 }
 
 // GetEvents returns recent trace events, optionally filtered.

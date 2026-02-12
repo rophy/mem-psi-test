@@ -65,6 +65,28 @@ struct {
     __type(value, __u64);
 } reclaim_count SEC(".maps");
 
+/*
+ * Check if a dentry is on a real disk filesystem (ext4, xfs, btrfs, etc.)
+ * vs a virtual/mount filesystem (cgroup2, overlay, proc, tmpfs, etc.).
+ * Used to distinguish the real VFS root from filesystem mount roots.
+ */
+static __always_inline bool is_real_root(struct dentry *d) {
+    char fstype[8];
+    const char *name = BPF_CORE_READ(d, d_sb, s_type, name);
+    if (!name)
+        return false;
+    if (bpf_probe_read_kernel_str(fstype, sizeof(fstype), (void *)name) <= 0)
+        return false;
+    /* Check common disk filesystem types */
+    if (fstype[0] == 'e' && fstype[1] == 'x' && fstype[2] == 't')
+        return true; /* ext2/ext3/ext4 */
+    if (fstype[0] == 'x' && fstype[1] == 'f' && fstype[2] == 's')
+        return true; /* xfs */
+    if (fstype[0] == 'b' && fstype[1] == 't' && fstype[2] == 'r')
+        return true; /* btrfs */
+    return false;
+}
+
 /* --- Helpers --- */
 
 static __always_inline struct dentry_stats *get_or_create_stats(__u64 cgid) {
@@ -140,6 +162,7 @@ int trace_d_alloc_path(struct pt_regs *ctx) {
     /* Declare all dentry pointers upfront (goto-safe) */
     const unsigned char *np;
     struct dentry *d2, *d3, *d4, *d5, *d6, *d7, *d8;
+    struct dentry *root_candidate = NULL;
 
     /* names[0]: new dentry name from qstr parameter */
     const struct qstr *qname = (const struct qstr *)PT_REGS_PARM2(ctx);
@@ -160,49 +183,52 @@ int trace_d_alloc_path(struct pt_regs *ctx) {
 
     /* names[2] */
     d2 = BPF_CORE_READ(parent, d_parent);
-    if (!d2 || d2 == parent) goto reached_root;
+    if (!d2 || d2 == parent) { root_candidate = parent; goto check_root; }
     np = BPF_CORE_READ(d2, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[2], MAX_NAME_LEN, (void *)np); evt->depth = 3; }
 
     /* names[3] */
     d3 = BPF_CORE_READ(d2, d_parent);
-    if (!d3 || d3 == d2) goto reached_root;
+    if (!d3 || d3 == d2) { root_candidate = d2; goto check_root; }
     np = BPF_CORE_READ(d3, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[3], MAX_NAME_LEN, (void *)np); evt->depth = 4; }
 
     /* names[4] */
     d4 = BPF_CORE_READ(d3, d_parent);
-    if (!d4 || d4 == d3) goto reached_root;
+    if (!d4 || d4 == d3) { root_candidate = d3; goto check_root; }
     np = BPF_CORE_READ(d4, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[4], MAX_NAME_LEN, (void *)np); evt->depth = 5; }
 
     /* names[5] */
     d5 = BPF_CORE_READ(d4, d_parent);
-    if (!d5 || d5 == d4) goto reached_root;
+    if (!d5 || d5 == d4) { root_candidate = d4; goto check_root; }
     np = BPF_CORE_READ(d5, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[5], MAX_NAME_LEN, (void *)np); evt->depth = 6; }
 
     /* names[6] */
     d6 = BPF_CORE_READ(d5, d_parent);
-    if (!d6 || d6 == d5) goto reached_root;
+    if (!d6 || d6 == d5) { root_candidate = d5; goto check_root; }
     np = BPF_CORE_READ(d6, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[6], MAX_NAME_LEN, (void *)np); evt->depth = 7; }
 
     /* names[7] */
     d7 = BPF_CORE_READ(d6, d_parent);
-    if (!d7 || d7 == d6) goto reached_root;
+    if (!d7 || d7 == d6) { root_candidate = d6; goto check_root; }
     np = BPF_CORE_READ(d7, d_name.name);
     if (np) { bpf_probe_read_kernel_str(evt->names[7], MAX_NAME_LEN, (void *)np); evt->depth = 8; }
 
     /* Check if there are more levels beyond 8 */
     d8 = BPF_CORE_READ(d7, d_parent);
-    if (!d8 || d8 == d7) goto reached_root;
+    if (!d8 || d8 == d7) { root_candidate = d7; goto check_root; }
 
     /* Truncated — more levels exist but we capped at 8 */
     goto submit;
 
-reached_root:
-    evt->depth |= DEPTH_ROOT_FLAG;
+check_root:
+    /* Only set root flag if this is a real disk filesystem (ext4/xfs/btrfs),
+     * not a virtual filesystem mount root (cgroup2, overlay, proc, etc.) */
+    if (root_candidate && is_real_root(root_candidate))
+        evt->depth |= DEPTH_ROOT_FLAG;
 
 submit:
     bpf_ringbuf_submit(evt, 0);

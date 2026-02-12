@@ -285,10 +285,10 @@ type EventsResponse struct {
 	Dropped    uint64       `json:"dropped"`
 }
 
-// buildPath reconstructs a full path from the name components.
+// buildPath reconstructs a path from the name components.
 // Components are stored leaf-to-root, so we reverse them.
-// If the eBPF walk reached the filesystem root, the path starts with "/".
-// Otherwise (truncated), no leading "/" signals a partial path.
+// Leading "/" means the path reached the real filesystem root (ext4/xfs/btrfs).
+// No leading "/" means the path is partial (truncated or hit a virtual fs mount root).
 func buildPath(evt *rawTraceEvent) string {
 	reachedRoot := evt.Depth&depthRootFlag != 0
 	depth := int(evt.Depth &^ depthRootFlag)

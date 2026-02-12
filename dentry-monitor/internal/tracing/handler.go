@@ -35,7 +35,6 @@ func (h *Handler) handleTraces(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	filter := EventFilter{
 		Pod:           q.Get("pod"),
-		Namespace:     q.Get("namespace"),
 		PathSubstring: q.Get("path"),
 	}
 

@@ -25,7 +25,6 @@ const (
 type TraceEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	Pod       string    `json:"pod"`
-	Namespace string    `json:"namespace"`
 	Container string    `json:"container"`
 	CgroupID  uint64    `json:"cgroup_id"`
 	Operation string    `json:"operation"`
@@ -149,12 +148,7 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 
 		if info != nil {
 			traceEvt.Pod = info.Pod
-			traceEvt.Namespace = info.Namespace
 			traceEvt.Container = info.Container
-		} else {
-			traceEvt.Pod = "unknown"
-			traceEvt.Namespace = "unknown"
-			traceEvt.Container = "unknown"
 		}
 
 		c.mu.Lock()
@@ -221,9 +215,6 @@ func (c *Consumer) GetEvents(filter EventFilter) EventsResponse {
 		if filter.Pod != "" && evt.Pod != filter.Pod {
 			continue
 		}
-		if filter.Namespace != "" && evt.Namespace != filter.Namespace {
-			continue
-		}
 		if filter.PathSubstring != "" && !containsSubstring(evt.Path, filter.PathSubstring) {
 			continue
 		}
@@ -281,7 +272,6 @@ func (c *Consumer) SetConfig(cfg TraceConfig) error {
 // EventFilter controls which events are returned by GetEvents.
 type EventFilter struct {
 	Pod           string
-	Namespace     string
 	PathSubstring string
 	Limit         int
 	Since         time.Time

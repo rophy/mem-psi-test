@@ -52,17 +52,17 @@ func NewCollector(statsMap, reclaimMap *ebpf.Map, resolver *cgroupmap.Resolver, 
 		allocDesc: prometheus.NewDesc(
 			"dentry_alloc_total",
 			"Total dentry allocations per container",
-			[]string{"pod", "namespace", "container"}, nil,
+			[]string{"pod", "container"}, nil,
 		),
 		posDesc: prometheus.NewDesc(
 			"dentry_positive_total",
 			"Total positive dentry instantiations per container",
-			[]string{"pod", "namespace", "container"}, nil,
+			[]string{"pod", "container"}, nil,
 		),
 		negDesc: prometheus.NewDesc(
 			"dentry_negative_total",
 			"Total negative dentry instantiations per container",
-			[]string{"pod", "namespace", "container"}, nil,
+			[]string{"pod", "container"}, nil,
 		),
 		reclaimDesc: prometheus.NewDesc(
 			"dentry_reclaim_total",
@@ -93,13 +93,13 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.mu.Unlock()
 
 	for cgID, s := range snapshot {
-		pod, ns, ctr := c.resolveLabels(cgID)
+		pod, ctr := c.resolveLabels(cgID)
 		ch <- prometheus.MustNewConstMetric(c.allocDesc, prometheus.CounterValue,
-			float64(s.Alloc), pod, ns, ctr)
+			float64(s.Alloc), pod, ctr)
 		ch <- prometheus.MustNewConstMetric(c.posDesc, prometheus.CounterValue,
-			float64(s.Positive), pod, ns, ctr)
+			float64(s.Positive), pod, ctr)
 		ch <- prometheus.MustNewConstMetric(c.negDesc, prometheus.CounterValue,
-			float64(s.Negative), pod, ns, ctr)
+			float64(s.Negative), pod, ctr)
 	}
 
 	// Reclaim counter
@@ -157,12 +157,12 @@ func (c *Collector) Start(interval time.Duration, stopCh <-chan struct{}) {
 	}
 }
 
-func (c *Collector) resolveLabels(cgID uint64) (pod, ns, container string) {
+func (c *Collector) resolveLabels(cgID uint64) (pod, container string) {
 	info := c.resolver.Resolve(cgID)
 	if info != nil {
-		return info.Pod, info.Namespace, info.Container
+		return info.Pod, info.Container
 	}
-	return fmt.Sprintf("cgroup-%d", cgID), "unknown", "unknown"
+	return fmt.Sprintf("cgroup-%d", cgID), ""
 }
 
 // readDentryState parses /proc/sys/fs/dentry-state.

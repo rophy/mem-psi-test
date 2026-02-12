@@ -15,7 +15,6 @@ import (
 // PodInfo holds resolved pod metadata for a cgroup ID.
 type PodInfo struct {
 	Pod       string
-	Namespace string
 	Container string
 	CgroupID  uint64
 }
@@ -144,6 +143,11 @@ func (r *Resolver) refresh() {
 
 // parseCgroupV2 reads /proc/<pid>/cgroup and returns the cgroup v2 path.
 // Format: "0::/path/to/cgroup"
+//
+// When reading host /proc from inside a container, the path may be relative
+// to the container's own cgroup (e.g. "/../../../burstable/pod.../container").
+// We clean the path and, if needed, prepend "/kubepods" to reconstruct the
+// absolute cgroup path.
 func (r *Resolver) parseCgroupV2(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -156,7 +160,21 @@ func (r *Resolver) parseCgroupV2(path string) string {
 		line := scanner.Text()
 		// cgroup v2 line: "0::<path>"
 		if strings.HasPrefix(line, "0::") {
-			return strings.TrimPrefix(line, "0::")
+			cgPath := strings.TrimPrefix(line, "0::")
+			// Clean relative paths (e.g. "/../../../burstable/pod.../cid")
+			cgPath = filepath.Clean(cgPath)
+			// If the path lost its "kubepods" prefix due to relative traversal,
+			// try to reconstruct it by finding where "burstable" or "besteffort"
+			// or "guaranteed" appears and prepending "/kubepods".
+			if !strings.Contains(cgPath, "kubepods") {
+				for _, qos := range []string{"/burstable/", "/besteffort/", "/guaranteed/"} {
+					if idx := strings.Index(cgPath, qos); idx >= 0 {
+						cgPath = "/kubepods" + cgPath[idx:]
+						break
+					}
+				}
+			}
+			return cgPath
 		}
 	}
 	return ""
@@ -211,8 +229,7 @@ func (r *Resolver) parsePodFromCgroupPath(cgPath string) *PodInfo {
 	// A production implementation would use client-go to resolve these.
 	info := &PodInfo{
 		Pod:       fmt.Sprintf("pod-%s", shortenUID(podUID)),
-		Namespace: "unknown",
-		Container: shortenID(containerID),
+		Container: containerID,
 	}
 
 	return info
@@ -227,12 +244,3 @@ func shortenUID(uid string) string {
 	return uid
 }
 
-func shortenID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	if id == "" {
-		return "unknown"
-	}
-	return id
-}

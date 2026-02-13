@@ -3,9 +3,9 @@ package tracing
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -23,13 +23,13 @@ const (
 
 // TraceEvent is a dentry trace event received from the eBPF ring buffer.
 type TraceEvent struct {
-	Timestamp time.Time `json:"timestamp"`
-	Pod       string    `json:"pod"`
-	Container string    `json:"container"`
-	CgroupID  uint64    `json:"cgroup_id"`
-	Operation string    `json:"operation"`
-	Path      string    `json:"path"`
-	Fstype    string    `json:"fstype"`
+	Timestamp time.Time
+	Pod       string
+	Container string
+	CgroupID  uint64
+	Operation string
+	Path      string
+	Fstype    string
 }
 
 // rawTraceEvent matches the eBPF struct dentry_trace_event layout.
@@ -47,10 +47,9 @@ type rawTraceEvent struct {
 const depthRootFlag = 0x80000000
 
 // TraceConfig controls tracing behavior.
-// Pattern filtering and rate limiting are done in userspace.
 type TraceConfig struct {
-	Enabled      bool     `json:"enabled"`
-	PathPatterns []string `json:"path_patterns"`
+	Enabled      bool
+	PathPatterns []string
 }
 
 // bpfTraceConfig matches the eBPF struct trace_config layout.
@@ -59,44 +58,47 @@ type bpfTraceConfig struct {
 	Pad     uint32
 }
 
-// Consumer reads trace events from the BPF ring buffer and stores
-// them in a circular buffer for HTTP API access.
+// Consumer reads trace events from the BPF ring buffer and writes them to a TSV file.
 type Consumer struct {
-	ringbufMap   *ebpf.Map
-	configMap    *ebpf.Map
-	resolver     *cgroupmap.Resolver
-
-	mu      sync.RWMutex
-	buffer  []TraceEvent
-	head    int  // next write position
-	count   int  // total events in buffer
-	bufSize int
-	dropped uint64
-
-	config TraceConfig
-
-	// Subscribers for SSE streaming
-	subMu   sync.Mutex
-	subs    map[uint64]chan TraceEvent
-	nextSub uint64
+	ringbufMap *ebpf.Map
+	configMap  *ebpf.Map
+	resolver   *cgroupmap.Resolver
+	config     TraceConfig
+	writer     *TSVWriter
 }
 
-// NewConsumer creates a trace event consumer.
-func NewConsumer(ringbufMap, configMap *ebpf.Map, resolver *cgroupmap.Resolver, bufSize int) *Consumer {
-	return &Consumer{
+// NewConsumer creates a trace event consumer that writes to the given TSV writer.
+// It applies the trace config to the eBPF config map immediately.
+func NewConsumer(ringbufMap, configMap *ebpf.Map, resolver *cgroupmap.Resolver, cfg TraceConfig, writer *TSVWriter) (*Consumer, error) {
+	c := &Consumer{
 		ringbufMap: ringbufMap,
 		configMap:  configMap,
 		resolver:   resolver,
-		buffer:     make([]TraceEvent, bufSize),
-		bufSize:    bufSize,
-		subs:       make(map[uint64]chan TraceEvent),
-		config: TraceConfig{
-			Enabled: false,
-		},
+		config:     cfg,
+		writer:     writer,
 	}
+	if err := c.applyBPFConfig(); err != nil {
+		return nil, fmt.Errorf("apply trace config: %w", err)
+	}
+	return c, nil
 }
 
-// Start begins consuming ring buffer events. Blocks until stopCh is closed.
+// applyBPFConfig pushes the trace config to the eBPF config map.
+func (c *Consumer) applyBPFConfig() error {
+	var bpfCfg bpfTraceConfig
+	if c.config.Enabled {
+		bpfCfg.Enabled = 1
+	}
+	var key uint32
+	if err := c.configMap.Update(&key, &bpfCfg, ebpf.UpdateAny); err != nil {
+		return err
+	}
+	log.Printf("tracing: config applied: enabled=%v patterns=%v", c.config.Enabled, c.config.PathPatterns)
+	return nil
+}
+
+// Start begins consuming ring buffer events and writing them to the TSV file.
+// Blocks until stopCh is closed.
 func (c *Consumer) Start(stopCh <-chan struct{}) {
 	rd, err := ringbuf.NewReader(c.ringbufMap)
 	if err != nil {
@@ -104,6 +106,23 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 		return
 	}
 	defer rd.Close()
+
+	// Periodic flush
+	flushTicker := time.NewTicker(1 * time.Second)
+	defer flushTicker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-flushTicker.C:
+				if err := c.writer.Flush(); err != nil {
+					log.Printf("tracing: flush error: %v", err)
+				}
+			case <-stopCh:
+				return
+			}
+		}
+	}()
 
 	go func() {
 		<-stopCh
@@ -124,9 +143,6 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 
 		evt, err := parseRawEvent(record.RawSample)
 		if err != nil {
-			c.mu.Lock()
-			c.dropped++
-			c.mu.Unlock()
 			continue
 		}
 
@@ -135,15 +151,12 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 		path := buildPath(evt)
 
 		// Userspace pattern filtering
-		c.mu.RLock()
-		patterns := c.config.PathPatterns
-		c.mu.RUnlock()
-		if len(patterns) > 0 && !matchesAnyPattern(path, patterns) {
+		if len(c.config.PathPatterns) > 0 && !matchesAnyPattern(path, c.config.PathPatterns) {
 			continue
 		}
 
 		var traceEvt TraceEvent
-		traceEvt.Timestamp = time.Now() // Use wall clock for JSON output
+		traceEvt.Timestamp = time.Now()
 		traceEvt.CgroupID = evt.CgroupID
 		traceEvt.Operation = opName(evt.Operation)
 		traceEvt.Path = path
@@ -154,138 +167,15 @@ func (c *Consumer) Start(stopCh <-chan struct{}) {
 			traceEvt.Container = info.Container
 		}
 
-		c.mu.Lock()
-		c.buffer[c.head] = traceEvt
-		c.head = (c.head + 1) % c.bufSize
-		if c.count < c.bufSize {
-			c.count++
-		}
-		c.mu.Unlock()
-
-		// Fan out to SSE subscribers (non-blocking)
-		c.subMu.Lock()
-		for _, ch := range c.subs {
-			select {
-			case ch <- traceEvt:
-			default:
-				// subscriber too slow, drop event
-			}
-		}
-		c.subMu.Unlock()
-	}
-}
-
-// Subscribe returns a channel that receives live trace events.
-// Call Unsubscribe with the returned ID when done.
-func (c *Consumer) Subscribe(bufSize int) (uint64, <-chan TraceEvent) {
-	ch := make(chan TraceEvent, bufSize)
-	c.subMu.Lock()
-	id := c.nextSub
-	c.nextSub++
-	c.subs[id] = ch
-	c.subMu.Unlock()
-	return id, ch
-}
-
-// Unsubscribe removes a subscriber and closes its channel.
-func (c *Consumer) Unsubscribe(id uint64) {
-	c.subMu.Lock()
-	if ch, ok := c.subs[id]; ok {
-		delete(c.subs, id)
-		close(ch)
-	}
-	c.subMu.Unlock()
-}
-
-// GetEvents returns recent trace events, optionally filtered.
-func (c *Consumer) GetEvents(filter EventFilter) EventsResponse {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	var events []TraceEvent
-
-	// Read from circular buffer in chronological order
-	start := 0
-	if c.count == c.bufSize {
-		start = c.head // buffer is full, oldest is at head
-	}
-
-	for i := 0; i < c.count; i++ {
-		idx := (start + i) % c.bufSize
-		evt := c.buffer[idx]
-
-		// Apply filters
-		if filter.Pod != "" && evt.Pod != filter.Pod {
-			continue
-		}
-		if filter.PathSubstring != "" && !containsSubstring(evt.Path, filter.PathSubstring) {
-			continue
-		}
-		if !filter.Since.IsZero() && evt.Timestamp.Before(filter.Since) {
-			continue
-		}
-
-		events = append(events, evt)
-
-		if filter.Limit > 0 && len(events) >= filter.Limit {
-			break
+		if err := c.writer.WriteEvent(traceEvt); err != nil {
+			log.Printf("tracing: write error: %v", err)
 		}
 	}
-
-	if events == nil {
-		events = []TraceEvent{}
-	}
-
-	return EventsResponse{
-		Events:     events,
-		Total:      len(events),
-		BufferSize: c.bufSize,
-		Dropped:    c.dropped,
-	}
 }
 
-// GetConfig returns the current trace configuration.
-func (c *Consumer) GetConfig() TraceConfig {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.config
-}
-
-// SetConfig updates the trace configuration and pushes it to the BPF map.
-func (c *Consumer) SetConfig(cfg TraceConfig) error {
-	var bpfCfg bpfTraceConfig
-	if cfg.Enabled {
-		bpfCfg.Enabled = 1
-	}
-
-	var key uint32
-	if err := c.configMap.Update(&key, &bpfCfg, ebpf.UpdateAny); err != nil {
-		return err
-	}
-
-	c.mu.Lock()
-	c.config = cfg
-	c.mu.Unlock()
-
-	log.Printf("tracing: config updated: enabled=%v patterns=%v",
-		cfg.Enabled, cfg.PathPatterns)
-	return nil
-}
-
-// EventFilter controls which events are returned by GetEvents.
-type EventFilter struct {
-	Pod           string
-	PathSubstring string
-	Limit         int
-	Since         time.Time
-}
-
-// EventsResponse is the JSON response for GET /traces.
-type EventsResponse struct {
-	Events     []TraceEvent `json:"events"`
-	Total      int          `json:"total"`
-	BufferSize int          `json:"buffer_size"`
-	Dropped    uint64       `json:"dropped"`
+// Close flushes and closes the TSV writer.
+func (c *Consumer) Close() error {
+	return c.writer.Close()
 }
 
 // buildPath reconstructs a path from the name components.

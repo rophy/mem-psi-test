@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +29,11 @@ func main() {
 		cgroupRoot      = flag.String("cgroup", "/sys/fs/cgroup", "Path to host cgroup filesystem")
 		pollInterval    = flag.Duration("poll-interval", 5*time.Second, "BPF map poll interval")
 		resolveInterval = flag.Duration("resolve-interval", 30*time.Second, "Cgroup→pod resolve interval")
-		traceBufferSize = flag.Int("trace-buffer", 10000, "Number of trace events to buffer")
+		traceEnabled    = flag.Bool("trace-enabled", false, "Enable dentry path tracing on startup")
+		traceDir        = flag.String("trace-dir", "/data/traces", "Directory for trace TSV output files")
+		traceMaxSizeMB  = flag.Int64("trace-max-size", 100, "Max trace file size in MB before rotation")
+		traceMaxFiles   = flag.Int("trace-max-files", 3, "Number of rotated trace files to keep")
+		tracePatterns   = flag.String("trace-patterns", "", "Comma-separated path substring filters (empty=all)")
 	)
 	flag.Parse()
 
@@ -91,17 +96,32 @@ func main() {
 	go collector.Start(*pollInterval, stopCh)
 	log.Printf("metrics collector started (poll every %s)", *pollInterval)
 
+	// Build trace config
+	traceCfg := tracing.TraceConfig{
+		Enabled: *traceEnabled,
+	}
+	if *tracePatterns != "" {
+		traceCfg.PathPatterns = strings.Split(*tracePatterns, ",")
+	}
+
+	// Create TSV writer
+	tsvWriter, err := tracing.NewTSVWriter(*traceDir, *traceMaxSizeMB*1024*1024, *traceMaxFiles)
+	if err != nil {
+		log.Fatalf("failed to create TSV writer: %v", err)
+	}
+
 	// Start trace consumer
-	consumer := tracing.NewConsumer(objs.TraceEvents(), objs.TraceConfigMap(), resolver, *traceBufferSize)
+	consumer, err := tracing.NewConsumer(objs.TraceEvents(), objs.TraceConfigMap(), resolver, traceCfg, tsvWriter)
+	if err != nil {
+		log.Fatalf("failed to create trace consumer: %v", err)
+	}
 	go consumer.Start(stopCh)
-	log.Printf("trace consumer started (buffer size %d)", *traceBufferSize)
+	log.Printf("trace consumer started (dir=%s, max_size=%dMB, max_files=%d, enabled=%v)",
+		*traceDir, *traceMaxSizeMB, *traceMaxFiles, *traceEnabled)
 
 	// HTTP server
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-
-	traceHandler := tracing.NewHandler(consumer)
-	traceHandler.RegisterRoutes(mux)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
@@ -126,5 +146,6 @@ func main() {
 	log.Printf("received %v, shutting down", sig)
 
 	close(stopCh)
+	consumer.Close()
 	server.Close()
 }

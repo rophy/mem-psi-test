@@ -5,7 +5,7 @@ eBPF-based per-container dentry monitoring for Kubernetes nodes.
 Attaches kprobes to kernel dentry functions (`d_alloc`, `d_instantiate`, `shrink_dcache_sb`) and exposes:
 
 - **Prometheus metrics** at `/metrics` — per-cgroup dentry allocation, positive/negative counts, node-level totals, reclaim events
-- **Tracing API** at `/traces` — opt-in file path capture via ring buffer
+- **Trace file output** — opt-in file path capture written to TSV files with size-based rotation
 
 ## Build
 
@@ -22,6 +22,7 @@ kubectl apply -f deploy/daemonset.yaml
 ```
 
 The DaemonSet runs one pod per node with privileged access for kprobe attachment.
+Trace files are written to the host at `/var/log/dentry-monitor/`.
 
 ## Usage
 
@@ -39,21 +40,55 @@ Key metrics:
 
 ### Tracing
 
-Enable tracing to capture dentry filenames:
+Tracing is controlled via CLI flags. When enabled, dentry path events are written to TSV files.
 
 ```bash
-# Enable
-curl -X PUT http://<node>:9090/traces/config -d '{"enabled":true}'
+# Enable tracing at startup
+dentry-monitor --trace-enabled --trace-dir=/data/traces
 
-# View events
-curl http://<node>:9090/traces?limit=10
+# Filter to specific path patterns
+dentry-monitor --trace-enabled --trace-patterns=".ibd,#sql,.frm"
+```
 
-# Filter by path pattern (userspace filtering)
-curl -X PUT http://<node>:9090/traces/config \
-  -d '{"enabled":true,"path_patterns":[".ibd","#sql"]}'
+#### Output files
 
-# Disable
-curl -X PUT http://<node>:9090/traces/config -d '{"enabled":false}'
+Files are written to `--trace-dir` with size-based rotation:
+
+```
+/var/log/dentry-monitor/
+├── traces.tsv       # active file
+├── traces.tsv.1     # most recent rotated
+├── traces.tsv.2
+└── traces.tsv.3     # oldest
+```
+
+#### File format
+
+Tab-separated values with header:
+
+```
+timestamp	pod	container	cgroup_id	operation	path	fstype
+```
+
+Example lines:
+
+```
+2026-02-13T18:54:13.648795455Z			3788	alloc	/var/lib/minikube/etcd/member/snap/0000000000000003.snap	ext4
+2026-02-13T19:09:00.768833899Z			3080	alloc	system.slice/kubelet.service/memory.swap.peak	cgroup2
+2026-02-13T18:43:23.513499951Z			2890	alloc	/usr/local/sbin/runc	tmpfs
+```
+
+#### Querying
+
+```bash
+# View latest events
+tail -f /var/log/dentry-monitor/traces.tsv
+
+# Filter to ext4 events
+grep ext4 /var/log/dentry-monitor/traces.tsv
+
+# Count events by filesystem type
+awk -F'\t' 'NR>1 {fs[$7]++} END {for(f in fs) print f, fs[f]}' traces.tsv
 ```
 
 ## Flags
@@ -65,4 +100,8 @@ curl -X PUT http://<node>:9090/traces/config -d '{"enabled":false}'
 | `--cgroup` | `/sys/fs/cgroup` | Path to host cgroup filesystem |
 | `--poll-interval` | `5s` | BPF map poll interval |
 | `--resolve-interval` | `30s` | Cgroup→pod resolve interval |
-| `--trace-buffer` | `10000` | Trace event circular buffer size |
+| `--trace-enabled` | `false` | Enable dentry path tracing on startup |
+| `--trace-dir` | `/data/traces` | Directory for trace TSV output files |
+| `--trace-max-size` | `100` | Max trace file size in MB before rotation |
+| `--trace-max-files` | `3` | Number of rotated trace files to keep |
+| `--trace-patterns` | (empty) | Comma-separated path substring filters |
